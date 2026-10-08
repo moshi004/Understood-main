@@ -153,7 +153,7 @@ module.exports = function registerBillingRoutes(app, deps) {
   }
 
   /** Loads everything for one org, issues any missing closed-month invoices, persists status. */
-  async function refreshOrg(orgId, cfg, nowMs, orgData) {
+  async function refreshOrgRaw(orgId, cfg, nowMs, orgData) {
     const [metaS, compS, billS] = await Promise.all(orgData ? [null, null, db().ref(`billing/orgs/${orgId}`).once("value")] : [
       db().ref(`organizations/${orgId}/metadata`).once("value"),
       db().ref(`organizations/${orgId}/computers`).once("value"),
@@ -203,6 +203,20 @@ module.exports = function registerBillingRoutes(app, deps) {
 
     const estimate = computeCharge(computers, ilMonth(nowMs), settings, cfg, nowMs);
     return {meta, settings, invoices, status: next, estimate, contract: bill.contract || null, trialEndsAt, computerCount: Object.keys(computers).length};
+  }
+
+  // Short-lived cache: every open dashboard re-asks every 15 min and the owner
+  // overview walks all orgs, each pulling the org's whole computers node.
+  // Cleared on any write action below, so changes still show immediately.
+  const orgCache = new Map();
+  const ORG_CACHE_MS = 30000;
+  async function refreshOrg(orgId, cfg, nowMs, orgData) {
+    if (orgData) return refreshOrgRaw(orgId, cfg, nowMs, orgData);
+    const c = orgCache.get(orgId);
+    if (c && Date.now() - c.t < ORG_CACHE_MS) return c.v;
+    const v = await refreshOrgRaw(orgId, cfg, nowMs, orgData);
+    orgCache.set(orgId, {t: Date.now(), v});
+    return v;
   }
 
   const audit = (orgId, by, action, details) =>
@@ -304,6 +318,7 @@ module.exports = function registerBillingRoutes(app, deps) {
 
   // ── POST /billing/ownerAction  (owner) ──────────────────────────────
   app.post("/billing/ownerAction", async (req, res) => {
+    orgCache.clear();
     try {
       const ownerUid = await verifyOwner(req);
       if (!ownerUid) return fail(res, 403, "Owner access required");
@@ -397,6 +412,7 @@ module.exports = function registerBillingRoutes(app, deps) {
 
   // ── POST /billing/acceptContract  (org admin) ───────────────────────
   app.post("/billing/acceptContract", async (req, res) => {
+    orgCache.clear();
     try {
       const {orgId, fullName, idNumber, role, agree} = req.body || {};
       if (!orgId) return fail(res, 400, "orgId required");
@@ -424,6 +440,7 @@ module.exports = function registerBillingRoutes(app, deps) {
 
   // ── POST /billing/payConfig  (org admin) ────────────────────────────
   app.post("/billing/payConfig", async (req, res) => {
+    orgCache.clear();
     try {
       const {orgId, month} = req.body || {};
       if (!orgId || !/^\d{4}-\d{2}$/.test(month || "")) return fail(res, 400, "orgId and month required");
@@ -460,6 +477,7 @@ module.exports = function registerBillingRoutes(app, deps) {
   // the owner sees the invoice as "claimed" until the webhook (or a manual
   // markPaid) settles it. One claim per invoice.
   app.post("/billing/confirm", async (req, res) => {
+    orgCache.clear();
     try {
       const {orgId, month, transactionId} = req.body || {};
       const who = await orgAccess(req, orgId);
@@ -478,6 +496,7 @@ module.exports = function registerBillingRoutes(app, deps) {
   // ── POST /billingCallback  (public webhook from Nedarim) ────────────
   // Param1 = month (YYYY-MM), Param2 = orgId, ?t= per-invoice secret token.
   app.post("/billingCallback", async (req, res) => {
+    orgCache.clear();
     try {
       const body = req.body || {};
       const month = String(body.Param1 || "");

@@ -55,6 +55,25 @@ admin.initializeApp({
   databaseURL: process.env.FIREBASE_DATABASE_URL,
 });
 
+// Safety net: a Realtime Database read that never answers (e.g. the project hit
+// its concurrent-connections cap) used to hang the HTTP request until the proxy
+// reset it, which the browser reports as a CORS / ERR_CONNECTION_RESET error.
+// Fail fast instead so the caller gets a real JSON error (with CORS headers).
+const RTDB_READ_TIMEOUT_MS = 15000;
+{
+  const Query = admin.database.Query;
+  const origOnce = Query.prototype.once;
+  Query.prototype.once = function(...args) {
+    const p = origOnce.apply(this, args);
+    if (args.length > 1) return p; // callback style - leave untouched
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("RTDB read timeout")), RTDB_READ_TIMEOUT_MS);
+    });
+    return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+  };
+}
+
 // ── Redis init (kiosk log shipping) ──────────────────────────────────
 // Self-bounded on purpose: every kiosk's log list is capped to the last
 // LOG_MAX_LINES entries (oldest dropped on push) AND has a TTL, so it is
@@ -1590,6 +1609,7 @@ app.post("/getOrgUserPassword", async (req, res) => {
 // Ingestion (kiosk -> bridge): simple static API key, same model as the
 // old entertainment-channel shipping used (kiosk is not a browser client
 // and doesn't carry a Firebase ID token for this).
+const ownerCache = new Map();
 async function verifyOwner(req) {
   const authHeader = req.headers.authorization || "";
   const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -1597,8 +1617,12 @@ async function verifyOwner(req) {
   let decodedToken;
   try { decodedToken = await admin.auth().verifyIdToken(idToken); }
   catch (e) { return null; }
+  const cached = ownerCache.get(decodedToken.uid);
+  if (cached && Date.now() - cached < 5 * 60 * 1000) return decodedToken.uid;
   const ownerSnapshot = await admin.database().ref(`owners/${decodedToken.uid}`).once("value");
-  return ownerSnapshot.exists() ? decodedToken.uid : null;
+  if (!ownerSnapshot.exists()) return null;
+  ownerCache.set(decodedToken.uid, Date.now());
+  return decodedToken.uid;
 }
 
 function requireRedis(res) {
