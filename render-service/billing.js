@@ -63,6 +63,15 @@ const daysInMonth = (ym) => { const {y, m} = parseYM(ym); return new Date(Date.U
 
 module.exports = function registerBillingRoutes(app, deps) {
   const {admin, verifyOwner} = deps;
+
+  // Kill switch: set BILLING_DISABLED=1 on Render to make every billing route
+  // answer 503 immediately, without touching Firebase at all.
+  if (process.env.BILLING_DISABLED === "1") {
+    console.warn("Billing routes DISABLED (BILLING_DISABLED=1)");
+    app.use(["/billing", "/billingCallback"], (req, res) =>
+      res.status(503).json({success: false, error: "billing disabled"}));
+    return;
+  }
   const db = () => admin.database();
 
   const fail = (res, code, error, extra) => res.status(code).json({success: false, error, ...(extra || {})});
