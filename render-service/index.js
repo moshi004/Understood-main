@@ -1355,6 +1355,57 @@ app.post("/confirmPayment", async (req, res) => {
 // require auth by default either; anyone can call registerOrganization
 // today).
 // ═══════════════════════════════════════════════════════════════════
+// Public Firebase web API key (the same one shipped in the web app's
+// config - not a secret). Used only to check an EXISTING admin's password
+// through the Auth REST API; the Admin SDK has no equivalent.
+const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY ||
+    "AIzaSyBcL4wpFbFDgQ4l0AXNADw3D9ht70lpJe4";
+
+// Looks up the existing Firebase Auth account for this admin email and
+// confirms the caller knows its current password. Returns {uid} on success
+// or {status, code, message} describing why registration must stop.
+async function verifyExistingAdminAccount(email, rawPassword, log) {
+  let response;
+  try {
+    response = await fetch(
+        "https://identitytoolkit.googleapis.com/v1/accounts:" +
+        `signInWithPassword?key=${FIREBASE_WEB_API_KEY}`,
+        {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            email,
+            password: toFirebasePassword(rawPassword),
+            returnSecureToken: false,
+          }),
+        });
+  } catch (error) {
+    log.error("Existing-account verification request failed", error);
+    return {status: 500, code: "internal",
+      message: "לא ניתן היה לאמת את החשבון הקיים. נסה שוב."};
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    const code = (body && body.error && body.error.message) || "";
+    log.warn("Existing-account verification rejected", {code});
+    if (/INVALID_PASSWORD|INVALID_LOGIN_CREDENTIALS/.test(code)) {
+      return {status: 403, code: "permission-denied",
+        message: "מספר הטלפון כבר רשום במערכת. כדי לפתוח ארגון נוסף על " +
+            "אותו מספר יש להזין את הסיסמה הקיימת של המספר."};
+    }
+    if (/TOO_MANY_ATTEMPTS/.test(code)) {
+      return {status: 429, code: "resource-exhausted",
+        message: "יותר מדי ניסיונות. נסה שוב מאוחר יותר."};
+    }
+    return {status: 500, code: "internal",
+      message: "לא ניתן היה לאמת את החשבון הקיים. נסה שוב."};
+  }
+
+  const existing = await admin.auth().getUserByEmail(email);
+  return {uid: existing.uid};
+}
+
 app.post("/registerOrganization", registrationLimiter, async (req, res) => {
   const correlationId = generateCorrelationId();
   const log = createLogger({correlationId, service: "organization-registration"});
@@ -1383,6 +1434,13 @@ app.post("/registerOrganization", registrationLimiter, async (req, res) => {
     if (!organizationName || !adminPhone || !adminPassword ||
         !adminFirstName || !adminLastName) {
       return callableError(res, 400, "invalid-argument", "חסרים שדות חובה");
+    }
+
+    // Same 4-char minimum as everywhere else; PINs shorter than 6 are
+    // prefixed by toFirebasePassword() before reaching Firebase Auth.
+    if (String(adminPassword).length < 4) {
+      return callableError(res, 400, "invalid-argument",
+          "הסיסמה חייבת להכיל לפחות 4 תווים");
     }
 
     const cleanOrgName = organizationName.trim();
@@ -1420,20 +1478,32 @@ app.post("/registerOrganization", registrationLimiter, async (req, res) => {
     log.info("Creating admin user in Firebase Auth", {email: adminFirebaseEmail, phone: cleanAdminPhone});
 
     let adminUid;
+    let reusedExistingAccount = false;
     try {
       const userRecord = await admin.auth().createUser({
         email: adminFirebaseEmail,
-        password: adminPassword,
+        password: toFirebasePassword(adminPassword),
         displayName: `${adminFirstName} ${adminLastName}`,
       });
       adminUid = userRecord.uid;
       log.info("Admin user created in Firebase Auth", {uid: adminUid});
     } catch (authError) {
-      log.error("Failed to create admin user in Firebase Auth", authError);
       if (authError.code === "auth/email-already-exists") {
-        return callableError(res, 409, "already-exists", "מספר הטלפון כבר רשום במערכת");
+        // The phone already has a login (same person runs another
+        // organization). One Firebase account can belong to several
+        // organizations, so reuse it - but only for someone who proves they
+        // own it with its current password. That password is never changed.
+        log.info("Phone already has an account - verifying ownership", {phone: cleanAdminPhone});
+        const verified = await verifyExistingAdminAccount(adminFirebaseEmail, adminPassword, log);
+        if (!verified.uid) {
+          return callableError(res, verified.status, verified.code, verified.message);
+        }
+        adminUid = verified.uid;
+        reusedExistingAccount = true;
+      } else {
+        log.error("Failed to create admin user in Firebase Auth", authError);
+        return callableError(res, 500, "internal", "Failed to create admin user: " + authError.message);
       }
-      return callableError(res, 500, "internal", "Failed to create admin user: " + authError.message);
     }
 
     const metadata = {
@@ -1471,7 +1541,7 @@ app.post("/registerOrganization", registrationLimiter, async (req, res) => {
     log.info("Admin user data saved to organization", {orgId, adminUid, isAdmin: true});
 
     return callableOk(res, {
-      success: true, orgId, adminUid,
+      success: true, orgId, adminUid, reusedExistingAccount,
       message: "Organization and admin user registered successfully",
       correlationId,
     });
