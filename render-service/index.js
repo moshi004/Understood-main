@@ -33,6 +33,15 @@ const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
 const Redis = require("ioredis");
 
+/**
+ * Amount string sent to Nedarim Plus: whole shekels stay "29" (packages are
+ * unaffected), amounts with agorot become "0.50" (always a dot, 2 decimals).
+ */
+function formatChargeAmount(amount) {
+  const rounded = Math.round(Number(amount) * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+}
+
 // This server's own public URL, used to build the CallBack= param sent to
 // Nedarim on the saved-card recurring charge (TashlumBodedNew) - per the
 // reference implementation, Nedarim expects CallBack on *every* charge
@@ -458,7 +467,7 @@ async function chargeViaDebitCard({
     ApiValid: apiPassword,
     Token: kevaId,
     Tokef: tokef,
-    Amount: amount.toFixed(0),
+    Amount: formatChargeAmount(amount),
     Tashloumim: "1",
     Currency: "1",
     ClientName: userFirstName && userLastName ? `${userFirstName} ${userLastName}` : (userFirstName || ""),
@@ -753,7 +762,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
 
     const debitKevaParams = {
       MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
-      Phone: "", CardNumber: kevaId, Tokef: tokef, Amount: amount.toFixed(0),
+      Phone: "", CardNumber: kevaId, Tokef: tokef, Amount: formatChargeAmount(amount),
       Tashloumim: "1", Groupe: "", Avour: avour, CVV: "",
       Day: String(today.getDate()), StartFrom: startFromIso, Zeout: "",
       Currency: "1", MasofId: "Online", Token: kevaId,
@@ -1015,7 +1024,7 @@ app.post("/chargeWithSavedCardRegular", async (req, res) => {
       ApiValid: apiPassword,
       Token: kevaId,
       Tokef: tokef,
-      Amount: amount.toFixed(0),
+      Amount: formatChargeAmount(amount),
       Tashloumim: "1",
       Currency: "1",
       ClientName: userFirstName && userLastName ? `${userFirstName} ${userLastName}` : (userFirstName || ""),
