@@ -1930,6 +1930,20 @@ app.delete("/logs", async (req, res) => {
 // Billing (usage-based charges for organizations) - see billing.js
 require("./billing")(app, {admin, verifyOwner});
 
+// Email copy of kiosk inquiries + email replies back into the kiosk - see mailReplies.js
+// (stays off unless GMAIL_USER and MAIL_HMAC_SECRET are set)
+const mailState = require("./mailReplies").start(admin);
+app.get("/mail/health", (req, res) => res.status(200).json({
+  enabled: mailState.enabled,
+  sendMode: mailState.sendMode,
+  imapConnected: mailState.imapConnected,
+  imapLastScanAt: mailState.imapLastScanAt,
+  orgsWatched: mailState.orgsWatched,
+  emailsSent: mailState.emailsSent,
+  repliesReceived: mailState.repliesReceived,
+  lastError: mailState.lastError,
+}));
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   // eslint-disable-next-line no-console
