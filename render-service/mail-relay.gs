@@ -54,7 +54,10 @@ function pollMessages_() {
       var id = msg.getId();
       if (done.indexOf(id) > -1) continue;
       var to = (msg.getTo() || '') + ' ' + (msg.getCc() || '');
-      if (to.indexOf('+t_') < 0) continue; // not a reply to a SIONYX inquiry
+      var subject = msg.getSubject() || '';
+      var byAddress = to.indexOf('+t_') > -1;
+      var bySubject = subject.indexOf('#t_') > -1 && subject.indexOf('[SIONYX]') !== 0; // our own outgoing mail starts with [SIONYX]
+      if (!byAddress && !bySubject) continue; // not a reply to a SIONYX inquiry
       out.push({ id: id, headers: splitHeaders_(msg.getRawContent()), text: msg.getPlainBody() });
       if (out.length >= 10) return { ok: true, messages: out };
     }

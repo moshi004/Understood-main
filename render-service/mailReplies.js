@@ -51,6 +51,7 @@ const ORG_REFRESH_MS = 10 * 60 * 1000; // pick up newly registered orgs
 const MAX_SEND_ATTEMPTS = 5;
 const TAG = /\+t_([a-f0-9]{16})@/i;
 const TAGGED = /\+t_/i;
+const SUBJECT_TAG = /#t_([a-f0-9]{16})/i;
 const SCAN_TIMEOUT_MS = 60 * 1000;
 
 const state = {
@@ -238,7 +239,7 @@ function makeOutgoing(admin) {
         `———\nלהשיב למשתמש: פשוט השב למייל הזה. התשובה תופיע אצלו בקיוסק.\n` +
         `אל תשנה את כתובת התגובה ואל תעביר את המייל הלאה.`;
 
-      await sendMail({to: email, subject: `[SIONYX] פנייה חדשה מ-${name}`, text, replyTo: replyToFor(tid)});
+      await sendMail({to: email, subject: `[SIONYX] פנייה חדשה מ-${name} #t_${tid}`, text, replyTo: replyToFor(tid)});
       state.emailsSent++;
       retries.delete(`${orgId}/${key}`);
       log(`sent inquiry org=${orgId} key=${key}`);
@@ -318,7 +319,8 @@ function makeIncoming(admin) {
     if ((auto && auto !== "no") || /bulk|auto_reply|junk/.test(prec)) return {resolved: false, reason: "auto-reply"};
 
     const header = [parsed.to && parsed.to.text, parsed.cc && parsed.cc.text, String(parsed.headers.get("delivered-to") || "")].join(" ");
-    const m = header.match(TAG);
+    // address tag (+t_<id>@) first; the subject tag (#t_<id>) covers the owner answering from the same mailbox that sends
+    const m = header.match(TAG) || String(parsed.subject || "").match(SUBJECT_TAG);
     if (!m) return {resolved: false, reason: "no tag"};
     const thread = (await db.ref(`mailBridge/threads/${m[1].toLowerCase()}`).once("value")).val();
     if (!thread || !thread.orgId || !thread.userId) return {resolved: false, reason: "unknown thread"};
@@ -328,7 +330,11 @@ function makeIncoming(admin) {
     const from = ((parsed.from && parsed.from.value && parsed.from.value[0] && parsed.from.value[0].address) || "").toLowerCase();
     if (!allowed || from !== allowed) return {resolved: false, forbidden: true, reason: `sender ${from || "?"} is not the inquiry address`};
     const sentByMailbox = from === cfg.user.toLowerCase() && opts.labels && [...opts.labels].some((l) => String(l).toLowerCase() === "\\sent");
-    if (!sentByMailbox && !isAuthenticated(authResultsLine(parsed), from.split("@")[1])) {
+    const authLine = authResultsLine(parsed);
+    // mail typed in this very mailbox (owner == sending account) carries no Gmail verdict at all; anything arriving
+    // from outside always carries one (pass or fail), so "no verdict + sender is the mailbox" can only be local mail
+    const localMail = from === cfg.user.toLowerCase() && !/mx\.google\.com/i.test(authLine);
+    if (!sentByMailbox && !localMail && !isAuthenticated(authLine, from.split("@")[1])) {
       return {resolved: false, forbidden: true, reason: `sender ${from} not verified by Gmail (no passing DKIM/SPF/DMARC)`};
     }
 
