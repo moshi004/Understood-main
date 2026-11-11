@@ -1963,6 +1963,9 @@ app.get("/mail/health", (req, res) => res.status(200).json({
   repliesReceived: mailState.repliesReceived,
   inboundCalls: mailState.inboundCalls,
   lastInbound: mailState.lastInbound,
+  scriptPolls: mailState.scriptPolls,
+  lastScriptPollAt: mailState.lastScriptPollAt,
+  lastScriptPollError: mailState.lastScriptPollError,
   lastError: mailState.lastError,
 }));
 

@@ -67,6 +67,9 @@ const state = {
   repliesReceived: 0,
   inboundCalls: 0,
   lastInbound: null,
+  scriptPolls: 0,
+  lastScriptPollAt: 0,
+  lastScriptPollError: null,
 };
 
 const log = (...a) => console.log(new Date().toISOString(), "[mail]", ...a); // eslint-disable-line no-console
@@ -138,14 +141,14 @@ function withTimeout(promise, ms, label) {
 
 let smtp = null;
 
-async function sendViaRelay({to, subject, text, replyTo}) {
+async function relayCall(body) {
   if (!cfg.relaySecret) throw new Error("MAIL_RELAY_SECRET not set");
   const res = await fetch(cfg.relayUrl, {
     method: "POST",
     redirect: "follow",
     // text/plain avoids a CORS preflight; Apps Script parses the JSON itself
     headers: {"Content-Type": "text/plain"},
-    body: JSON.stringify({secret: cfg.relaySecret, to, subject, text, replyTo, name: cfg.fromName}),
+    body: JSON.stringify({secret: cfg.relaySecret, ...body}),
     signal: AbortSignal.timeout(60000),
   });
   const raw = await res.text();
@@ -153,9 +156,14 @@ async function sendViaRelay({to, subject, text, replyTo}) {
   try {
     data = JSON.parse(raw);
   } catch {
-    throw new Error(`relay: invalid response (HTTP ${res.status}) - is the Apps Script deployed as "Anyone"?`);
+    throw new Error(`relay: invalid response (HTTP ${res.status}) - is the Apps Script deployed as "Anyone" (new version)?`);
   }
   if (!data.ok) throw new Error("relay: " + (data.error || "unknown error"));
+  return data;
+}
+
+async function sendViaRelay({to, subject, text, replyTo}) {
+  await relayCall({to, subject, text, replyTo, name: cfg.fromName});
 }
 
 async function sendMail(message) {
@@ -382,7 +390,7 @@ let stopped = false;
 
 async function runImap(admin) {
   if (!cfg.pass) {
-    log("GMAIL_APP_PASSWORD not set - IMAP is off; replies arrive via the Apps Script poller (/mail/inbound)");
+    log("GMAIL_APP_PASSWORD not set - IMAP is off; replies are fetched from the Apps Script instead");
     return;
   }
   const inc = makeIncoming(admin);
@@ -490,6 +498,51 @@ async function handleInbound(admin, payload) {
   return {resolved: !!r.resolved, reason};
 }
 
+// The bridge asks the Apps Script web app for new replies (action "poll") and confirms the handled ones ("ack").
+// This needs nothing but the relay that already sends mail: no IMAP, no app password, no script-side trigger.
+async function pollScriptOnce(admin) {
+  const data = await relayCall({action: "poll"});
+  state.scriptPolls++;
+  state.lastScriptPollAt = Date.now();
+  const handled = [];
+  for (const m of data.messages || []) {
+    try {
+      await handleInbound(admin, {headers: m.headers, text: m.text});
+      handled.push(m.id); // delivered or definitively rejected: do not offer it again
+    } catch (e) {
+      state.lastError = describeErr(e); // transient (Firebase): leave it for the next poll
+      log("poll: could not handle a reply, will retry:", state.lastError);
+    }
+  }
+  if (handled.length) await relayCall({action: "ack", ids: handled});
+  state.lastScriptPollError = null;
+}
+
+function startScriptPolling(admin) {
+  if (!cfg.relayUrl || env.MAIL_SCRIPT_POLL === "off") return;
+  const every = Math.max(30, num(env.MAIL_SCRIPT_POLL_SECONDS, 120)) * 1000;
+  let busy = false;
+  let lastLogged = "";
+  const tick = async () => {
+    if (busy || stopped) return;
+    busy = true;
+    try {
+      await pollScriptOnce(admin);
+    } catch (e) {
+      state.lastScriptPollError = describeErr(e);
+      if (state.lastScriptPollError !== lastLogged) { // log each distinct problem once, not every poll
+        lastLogged = state.lastScriptPollError;
+        log("script poll error:", lastLogged);
+      }
+    } finally {
+      busy = false;
+    }
+  };
+  setTimeout(tick, 5000).unref();
+  setInterval(tick, every).unref();
+  log(`polling Apps Script for replies every ${every / 1000}s`);
+}
+
 // ───────────────────────── entry point ─────────────────────────
 
 function start(admin) {
@@ -508,8 +561,9 @@ function start(admin) {
     log("watchReplies failed", state.lastError);
   });
   runImap(admin).catch((e) => log("IMAP loop crashed", describeErr(e)));
+  startScriptPolling(admin);
   log(`enabled (send via ${state.sendMode})`);
   return state;
 }
 
-module.exports = {start, state, handleInbound, extractReplyText, isAuthenticated, tidFor, _internals: {makeIncoming, makeOutgoing, buildSource}};
+module.exports = {start, state, handleInbound, extractReplyText, isAuthenticated, tidFor, _internals: {makeIncoming, makeOutgoing, buildSource, pollScriptOnce}};

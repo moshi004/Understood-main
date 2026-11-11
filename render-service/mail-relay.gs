@@ -15,6 +15,8 @@ function doPost(e) {
     var data = JSON.parse(e.postData.contents);
     var secret = PropertiesService.getScriptProperties().getProperty('RELAY_SECRET');
     if (!secret || data.secret !== secret) return json_({ ok: false, error: 'unauthorized' });
+    if (data.action === 'poll') return json_(pollMessages_());
+    if (data.action === 'ack') return json_(ackMessages_(data.ids));
     if (!data.to || !data.subject) return json_({ ok: false, error: 'missing to/subject' });
     var options = { name: data.name || 'SIONYX' };
     if (data.replyTo) options.replyTo = data.replyTo;
@@ -30,52 +32,40 @@ function json_(obj) {
 }
 
 /**
- * Reply poller: reads owner replies from Gmail and hands them to the bridge (no IMAP / app password needed).
- * One-time setup: Script properties -> add BRIDGE_INBOUND_URL = https://<your-bridge>/mail/inbound
- * then pick "setupTrigger" in the editor toolbar and press Run (approve the permissions).
+ * Replies: the bridge calls this web app with {action:'poll'} and gets the new owner replies found in Gmail,
+ * then confirms the handled ones with {action:'ack', ids:[...]}. No trigger and no outgoing fetch needed.
+ * Run pollMessages_ once from the editor to approve the Gmail read permission, then redeploy a new version.
  */
-function setupTrigger() {
-  ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === 'pollReplies') ScriptApp.deleteTrigger(t);
-  });
-  ScriptApp.newTrigger('pollReplies').timeBased().everyMinutes(1).create();
+function splitHeaders_(raw) {
+  var CR = String.fromCharCode(13);
+  var LF = String.fromCharCode(10);
+  var cut = raw.indexOf(CR + LF + CR + LF);
+  if (cut < 0) cut = raw.indexOf(LF + LF);
+  return cut > 0 ? raw.substring(0, cut) : raw;
 }
 
-function pollReplies() {
-  var props = PropertiesService.getScriptProperties();
-  var url = props.getProperty('BRIDGE_INBOUND_URL');
-  var secret = props.getProperty('RELAY_SECRET');
-  if (!url || !secret) return;
-
-  var done = JSON.parse(props.getProperty('DONE_IDS') || '[]');
-  var doneSet = {};
-  done.forEach(function (id) { doneSet[id] = true; });
-
-  var threads = GmailApp.search('newer_than:2d', 0, 30);
-  var groups = GmailApp.getMessagesForThreads(threads);
-  var changed = false;
+function pollMessages_() {
+  var done = JSON.parse(PropertiesService.getScriptProperties().getProperty('DONE_IDS') || '[]');
+  var out = [];
+  var groups = GmailApp.getMessagesForThreads(GmailApp.search('newer_than:2d', 0, 30));
   for (var i = 0; i < groups.length; i++) {
     for (var j = 0; j < groups[i].length; j++) {
       var msg = groups[i][j];
       var id = msg.getId();
-      if (doneSet[id]) continue;
-      var recipients = (msg.getTo() || '') + ' ' + (msg.getCc() || '');
-      if (!/\+t_[a-f0-9]{16}@/i.test(recipients)) continue; // not a reply to a SIONYX inquiry
-
-      var raw = msg.getRawContent();
-      var cut = raw.search(/\r?\n\r?\n/);
-      var res = UrlFetchApp.fetch(url, {
-        method: 'post',
-        contentType: 'application/json',
-        payload: JSON.stringify({ secret: secret, headers: cut > 0 ? raw.substring(0, cut) : raw, text: msg.getPlainBody() }),
-        muteHttpExceptions: true
-      });
-      if (res.getResponseCode() === 200) { // handled (delivered or definitively rejected): never send again
-        done.push(id);
-        doneSet[id] = true;
-        changed = true;
-      } // otherwise (bridge asleep/error) it is retried on the next run while it is within the 2-day window
+      if (done.indexOf(id) > -1) continue;
+      var to = (msg.getTo() || '') + ' ' + (msg.getCc() || '');
+      if (to.indexOf('+t_') < 0) continue; // not a reply to a SIONYX inquiry
+      out.push({ id: id, headers: splitHeaders_(msg.getRawContent()), text: msg.getPlainBody() });
+      if (out.length >= 10) return { ok: true, messages: out };
     }
   }
-  if (changed) props.setProperty('DONE_IDS', JSON.stringify(done.slice(-300)));
+  return { ok: true, messages: out };
+}
+
+function ackMessages_(ids) {
+  var props = PropertiesService.getScriptProperties();
+  var done = JSON.parse(props.getProperty('DONE_IDS') || '[]');
+  for (var i = 0; i < (ids || []).length; i++) done.push(ids[i]);
+  props.setProperty('DONE_IDS', JSON.stringify(done.slice(-300)));
+  return { ok: true };
 }
