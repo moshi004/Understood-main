@@ -60,6 +60,9 @@ const state = {
   imapLastScanAt: 0,
   lastError: null,
   orgsWatched: 0,
+  repliesSeen: 0,
+  lastSeen: null,
+  lastSkip: null,
   emailsSent: 0,
   repliesReceived: 0,
 };
@@ -183,19 +186,32 @@ function makeOutgoing(admin) {
   const db = admin.database();
   const retries = new Map(); // `${org}/${key}` -> attempts
 
+  // every skip is logged and shown in /mail/health (lastSkip) so a missing email can always be explained
+  function skip(orgId, key, reason) {
+    state.lastSkip = {at: Date.now(), org: orgId, key, reason};
+    log(`skip org=${orgId} key=${key}: ${reason}`);
+  }
+
   async function handleReply(orgId, key, r, enabledSince) {
-    if (!r || r.fromSupervisorReply === true || !r.fromUserId) return; // only user -> org admin
+    state.repliesSeen++;
+    state.lastSeen = {at: Date.now(), org: orgId, key};
+    log(`reply seen org=${orgId} key=${key}`);
+    if (!r) return skip(orgId, key, "empty record");
+    if (r.fromSupervisorReply === true) return skip(orgId, key, "addressed to supervisor, not the org admin");
+    if (!r.fromUserId) return skip(orgId, key, "no fromUserId");
     const message = stripBidi(r.message).trim();
-    if (!message) return;
-    if (!(Number(r.timestamp) >= enabledSince)) return;
+    if (!message) return skip(orgId, key, "empty message");
+    if (!(Number(r.timestamp) >= enabledSince)) {
+      return skip(orgId, key, `timestamp ${JSON.stringify(r.timestamp)} is not a number >= enabledSince ${enabledSince} (older, or kiosk clock behind)`);
+    }
 
     const claim = await db.ref(`mailBridge/sent/${orgId}/${key}`).transaction((cur) => (cur === null ? {at: Date.now()} : undefined));
-    if (!claim.committed) return; // already handled
+    if (!claim.committed) return skip(orgId, key, "already handled earlier");
 
     const {email, orgName} = await inquiryEmailFor(db, orgId);
     if (!email) {
       await db.ref(`mailBridge/sent/${orgId}/${key}`).set({at: Date.now(), skipped: "no-email"});
-      return;
+      return skip(orgId, key, "no valid inquiry email for this org (settings/inquiries/email or admin_email), or disabled");
     }
 
     try {
