@@ -1932,7 +1932,24 @@ require("./billing")(app, {admin, verifyOwner});
 
 // Email copy of kiosk inquiries + email replies back into the kiosk - see mailReplies.js
 // (stays off unless GMAIL_USER and MAIL_HMAC_SECRET are set)
-const mailState = require("./mailReplies").start(admin);
+const mailReplies = require("./mailReplies");
+const mailState = mailReplies.start(admin);
+
+// Replies read by the Apps Script poller (mail-relay.gs pollReplies) - authenticated with the shared relay secret
+app.post("/mail/inbound", async (req, res) => {
+  const secret = process.env.MAIL_RELAY_SECRET || "";
+  const given = Buffer.from(String((req.body && req.body.secret) || ""));
+  const want = Buffer.from(secret);
+  if (!secret || given.length !== want.length || !require("crypto").timingSafeEqual(given, want)) {
+    return res.status(401).json({ok: false, error: "unauthorized"});
+  }
+  try {
+    return res.status(200).json({ok: true, ...(await mailReplies.handleInbound(admin, req.body))});
+  } catch (e) {
+    console.error("[mail] inbound failed:", e.message);
+    return res.status(500).json({ok: false, error: "failed"});
+  }
+});
 app.get("/mail/health", (req, res) => res.status(200).json({
   enabled: mailState.enabled,
   sendMode: mailState.sendMode,
@@ -1944,6 +1961,8 @@ app.get("/mail/health", (req, res) => res.status(200).json({
   lastSkip: mailState.lastSkip,
   emailsSent: mailState.emailsSent,
   repliesReceived: mailState.repliesReceived,
+  inboundCalls: mailState.inboundCalls,
+  lastInbound: mailState.lastInbound,
   lastError: mailState.lastError,
 }));
 

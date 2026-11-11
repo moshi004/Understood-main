@@ -65,6 +65,8 @@ const state = {
   lastSkip: null,
   emailsSent: 0,
   repliesReceived: 0,
+  inboundCalls: 0,
+  lastInbound: null,
 };
 
 const log = (...a) => console.log(new Date().toISOString(), "[mail]", ...a); // eslint-disable-line no-console
@@ -373,14 +375,14 @@ function makeIncoming(admin) {
     }
   }
 
-  return {scan};
+  return {scan, handleIncoming};
 }
 
 let stopped = false;
 
 async function runImap(admin) {
   if (!cfg.pass) {
-    log("GMAIL_APP_PASSWORD not set - email replies (IMAP) are off; sending still works");
+    log("GMAIL_APP_PASSWORD not set - IMAP is off; replies arrive via the Apps Script poller (/mail/inbound)");
     return;
   }
   const inc = makeIncoming(admin);
@@ -451,6 +453,43 @@ async function runImap(admin) {
   }
 }
 
+// ───────────────────────── incoming via Apps Script (no IMAP / no app password) ─────────────────────────
+//
+// The Apps Script (mail-relay.gs, pollReplies) runs as the mailbox owner, reads the replies in Gmail and POSTs
+// {headers, text} to /mail/inbound. We rebuild a small RFC822 message and run it through the same checks as IMAP
+// (tag -> thread, sender == inquiry address, Gmail DKIM/SPF/DMARC verdict, auto-reply filter, quote cutting).
+
+const DROP_HEADERS = new Set(["content-type", "content-transfer-encoding", "mime-version", "content-disposition"]);
+
+function buildSource(headerBlock, text) {
+  const kept = [];
+  let dropping = false;
+  for (const line of String(headerBlock || "").replace(/\r\n/g, "\n").split("\n")) {
+    if (/^[ \t]/.test(line)) {
+      if (!dropping) kept.push(line); // folded continuation of the previous header
+      continue;
+    }
+    dropping = DROP_HEADERS.has((line.split(":")[0] || "").trim().toLowerCase());
+    if (!dropping && line) kept.push(line);
+  }
+  return kept.join("\r\n") + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n" + String(text || "");
+}
+
+let inboundHandler = null;
+
+async function handleInbound(admin, payload) {
+  if (!inboundHandler) inboundHandler = makeIncoming(admin);
+  state.inboundCalls++;
+  const headers = String((payload && payload.headers) || "").slice(0, 30000);
+  const text = String((payload && payload.text) || "").slice(0, 30000);
+  const r = await inboundHandler.handleIncoming(buildSource(headers, text), {});
+  const reason = r.resolved ? null : (r.forbidden ? "REJECTED - " + r.reason : r.empty ? "empty text after removing the quote" : r.reason);
+  state.lastInbound = {at: Date.now(), resolved: !!r.resolved, reason};
+  if (r.resolved) state.repliesReceived++;
+  log(r.resolved ? `reply delivered (apps script) org=${r.orgId}` : `reply from apps script not routed: ${reason}`);
+  return {resolved: !!r.resolved, reason};
+}
+
 // ───────────────────────── entry point ─────────────────────────
 
 function start(admin) {
@@ -473,4 +512,4 @@ function start(admin) {
   return state;
 }
 
-module.exports = {start, state, extractReplyText, isAuthenticated, tidFor, _internals: {makeIncoming, makeOutgoing}};
+module.exports = {start, state, handleInbound, extractReplyText, isAuthenticated, tidFor, _internals: {makeIncoming, makeOutgoing, buildSource}};
