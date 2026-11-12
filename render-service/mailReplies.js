@@ -23,6 +23,16 @@
  *   mailBridge/sent/{org}/{replyKey} claim marker so a reply is emailed exactly once
  *   mailBridge/threads/{tid}         {orgId, userId} - resolves an incoming reply address
  *
+ * Supervisor message copies (Annex A 3.4) - second outgoing flow:
+ *   supervisor sends a message                ->  organizations/{org}/messages/{key}  {fromSupervisor: true, fromAdminId: <supervisor uid>, toUserId}
+ *   this module (Firebase listener)           ->  email copy to
+ *       (a) the org's inquiry address, ONLY when organizations/{org}/metadata/supervision/mailCopy/enabled === true
+ *           (Reply-To = same per-user tag as above, so the org can answer and the answer reaches that user)
+ *       (b) the supervisor's own address, when supervisors/{uid}/mailCopy = {email, enabled !== false} (copy only, no reply)
+ *   Off by default: an org without the switch and a supervisor without an address send nothing.
+ *   mailBridge/supervisorCopySince           ms timestamp, set once; older supervisor messages are never emailed
+ *   mailBridge/sentSupervisor/{org}/{key}/{org|sup}   per-recipient claim marker, so each copy is sent exactly once
+ *
  * Inquiry address per org: organizations/{org}/metadata/settings/inquiries/email,
  * falling back to metadata/admin_email. settings/inquiries/enabled === false turns it off.
  */
@@ -65,6 +75,7 @@ const state = {
   lastSeen: null,
   lastSkip: null,
   emailsSent: 0,
+  supervisorCopiesSent: 0,
   repliesReceived: 0,
   inboundCalls: 0,
   lastInbound: null,
@@ -257,6 +268,92 @@ function makeOutgoing(admin) {
   return {handleReply};
 }
 
+// ───────────────────────── outgoing: supervisor message -> email copies (3.4) ─────────────────────────
+
+const EMAIL_OK = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+/**
+ * Pure: who gets a copy of a supervisor message. Nothing unless a switch/address is set.
+ *   orgSwitchOn   metadata/supervision/mailCopy/enabled === true
+ *   orgEmail      the org's inquiry address (already null when the org disabled inquiries)
+ *   supMail       supervisors/{uid}/mailCopy record or null
+ */
+function copyRecipients({orgSwitchOn, orgEmail, supMail}) {
+  const out = [];
+  if (orgSwitchOn === true && orgEmail) out.push({kind: "org", to: orgEmail});
+  const supEmail = supMail && supMail.enabled !== false ? String(supMail.email || "").trim().toLowerCase() : "";
+  if (EMAIL_OK.test(supEmail) && !out.some((r) => r.to === supEmail)) out.push({kind: "sup", to: supEmail});
+  return out;
+}
+
+function makeSupervisorCopy(admin) {
+  const db = admin.database();
+  const retries = new Map(); // `${org}/${key}/${kind}` -> attempts
+
+  async function handleMessage(orgId, key, m, since) {
+    if (!m || m.fromSupervisor !== true || m.deleted) return;
+    if (!(Number(m.timestamp) >= since)) return;
+    const message = stripBidi(m.message).trim();
+    if (!message) return;
+
+    const [orgSwitchSnap, supSnap, inq] = await Promise.all([
+      db.ref(`organizations/${orgId}/metadata/supervision/mailCopy/enabled`).once("value"),
+      m.fromAdminId ? db.ref(`supervisors/${m.fromAdminId}/mailCopy`).once("value") : Promise.resolve({val: () => null}),
+      inquiryEmailFor(db, orgId),
+    ]);
+    const recipients = copyRecipients({orgSwitchOn: orgSwitchSnap.val() === true, orgEmail: inq.email, supMail: supSnap.val()});
+    if (!recipients.length) return; // nothing switched on for this message: stay silent
+
+    let name = "כל המשתמשים";
+    let tid = null;
+    if (m.toUserId && m.toUserId !== "all") {
+      const u = (await db.ref(`organizations/${orgId}/users/${m.toUserId}`).once("value")).val();
+      if (u) {
+        name = [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || "משתמש";
+        tid = tidFor(orgId, m.toUserId);
+        await db.ref(`mailBridge/threads/${tid}`).set({orgId, userId: m.toUserId});
+      }
+    }
+    const dept = m.department ? `מחלקה: ${m.department}\n` : "";
+    let supName = "";
+    if (m.fromAdminId) supName = String((await db.ref(`supervisors/${m.fromAdminId}/displayName`).once("value")).val() || "").trim();
+
+    for (const r of recipients) {
+      const claimRef = db.ref(`mailBridge/sentSupervisor/${orgId}/${key}/${r.kind}`);
+      const claim = await claimRef.transaction((cur) => (cur === null ? {at: Date.now()} : undefined));
+      if (!claim.committed) continue; // this copy was already sent
+      const id = `${orgId}/${key}/${r.kind}`;
+      try {
+        const canReply = r.kind === "org" && tid;
+        const text =
+          `הודעת מפקח${supName ? ` (${supName})` : ""}${inq.orgName ? ` - ${inq.orgName}` : ""}\n` +
+          `אל: ${name}\n${dept}\n${message}\n\n———\n` +
+          (canReply
+            ? "להשיב למשתמש: פשוט השב למייל הזה. התשובה תופיע אצלו בקיוסק.\nאל תשנה את כתובת התגובה ואל תעביר את המייל הלאה."
+            : "זהו עותק לידיעה בלבד.");
+        await sendMail({
+          to: r.to,
+          subject: `[SIONYX] ${r.kind === "org" ? "הודעת מפקח אל" : "עותק הודעה שנשלחה אל"} ${name}${canReply ? ` #t_${tid}` : ""}`,
+          text,
+          replyTo: canReply ? replyToFor(tid) : undefined,
+        });
+        state.supervisorCopiesSent++;
+        retries.delete(id);
+        log(`supervisor copy sent org=${orgId} key=${key} to=${r.kind}`);
+      } catch (e) {
+        state.lastError = describeErr(e);
+        await claimRef.remove().catch(() => {});
+        const n = (retries.get(id) || 0) + 1;
+        retries.set(id, n);
+        log(`supervisor copy failed (${n}/${MAX_SEND_ATTEMPTS}) org=${orgId} key=${key} to=${r.kind}: ${state.lastError}`);
+        if (n < MAX_SEND_ATTEMPTS) setTimeout(() => handleMessage(orgId, key, m, since).catch(() => {}), 2 * 60 * 1000 * n);
+      }
+    }
+  }
+
+  return {handleMessage};
+}
+
 async function listOrgIds(admin) {
   const app = admin.app();
   const {access_token: token} = await app.options.credential.getAccessToken();
@@ -281,6 +378,17 @@ async function watchReplies(admin) {
   }
   const from = Math.max(Date.now() - BACKFILL_MS, enabledSince);
 
+  // supervisor message copies have their own start marker: messages sent before this feature existed are never emailed
+  const copySinceRef = db.ref("mailBridge/supervisorCopySince");
+  let copySince = (await copySinceRef.once("value")).val();
+  if (!copySince) {
+    copySince = Date.now();
+    await copySinceRef.set(copySince);
+    log("supervisor copies: first start, older supervisor messages are never emailed");
+  }
+  const copyFrom = Math.max(Date.now() - BACKFILL_MS, copySince);
+  const copies = makeSupervisorCopy(admin);
+
   const watched = new Set();
   const refresh = async () => {
     try {
@@ -294,6 +402,13 @@ async function watchReplies(admin) {
                 log("handleReply error", state.lastError);
               });
             }, (err) => log(`listener cancelled org=${orgId}: ${err.message}`));
+        db.ref(`organizations/${orgId}/messages`).orderByChild("timestamp").startAt(copyFrom)
+            .on("child_added", (snap) => {
+              copies.handleMessage(orgId, snap.key, snap.val(), copySince).catch((e) => {
+                state.lastError = describeErr(e);
+                log("supervisor copy error", state.lastError);
+              });
+            }, (err) => log(`supervisor-copy listener cancelled org=${orgId}: ${err.message}`));
       }
       state.orgsWatched = watched.size;
     } catch (e) {
@@ -572,4 +687,4 @@ function start(admin) {
   return state;
 }
 
-module.exports = {start, state, handleInbound, extractReplyText, isAuthenticated, tidFor, _internals: {makeIncoming, makeOutgoing, buildSource, pollScriptOnce}};
+module.exports = {start, state, handleInbound, extractReplyText, isAuthenticated, tidFor, copyRecipients, _internals: {makeIncoming, makeOutgoing, buildSource, pollScriptOnce}};
