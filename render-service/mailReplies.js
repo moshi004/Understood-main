@@ -365,6 +365,42 @@ function makeSupervisorCopy(admin) {
   return {handleMessage};
 }
 
+/** Annex A 2.2: mail to the supervision organization when its supervisor logs in or out (switch: supervisors/{uid}/switchProfile/sessionMail). */
+function makeSessionMail(admin) {
+  const db = admin.database();
+  async function handleEvent(key, ev, since) {
+    if (!ev || !ev.uid || (ev.type !== "login" && ev.type !== "logout")) return;
+    if (!(Number(ev.at) >= since)) return;
+    const [onSnap, mailSnap, nameSnap] = await Promise.all([
+      db.ref(`supervisors/${ev.uid}/switchProfile/sessionMail`).once("value"),
+      db.ref(`supervisors/${ev.uid}/mailCopy`).once("value"),
+      db.ref(`supervisors/${ev.uid}/name`).once("value"),
+    ]);
+    const mail = mailSnap.val() || {};
+    const to = String(mail.email || "").trim();
+    if (onSnap.val() !== true || mail.enabled === false || !to) return;
+    const claimRef = db.ref(`mailBridge/sentSession/${key}`);
+    const claim = await claimRef.transaction((cur) => (cur === null ? {at: Date.now()} : undefined));
+    if (!claim.committed) return;
+    const when = new Date(Number(ev.at)).toLocaleString("he-IL", {timeZone: "Asia/Jerusalem"});
+    const name = String(nameSnap.val() || "").trim();
+    const action = ev.type === "login" ? "כניסה" : "יציאה";
+    try {
+      await sendMail({
+        to,
+        subject: `[SIONYX] ${action} לממשק המפקח${name ? ` - ${name}` : ""}`,
+        text: `${action} לממשק המפקח${name ? ` (${name})` : ""}\nזמן: ${when}\n\nאם לא אתם ביצעתם זאת, החליפו סיסמה.`,
+      });
+      log(`session mail sent uid=${ev.uid} type=${ev.type}`);
+    } catch (e) {
+      state.lastError = describeErr(e);
+      await claimRef.remove().catch(() => {});
+      log("session mail failed", state.lastError);
+    }
+  }
+  return {handleEvent};
+}
+
 async function listOrgIds(admin) {
   const app = admin.app();
   const {access_token: token} = await app.options.credential.getAccessToken();
@@ -399,6 +435,13 @@ async function watchReplies(admin) {
   }
   const copyFrom = Math.max(Date.now() - BACKFILL_MS, copySince);
   const copies = makeSupervisorCopy(admin);
+
+  const sessionSince = Date.now();
+  const sessionMail = makeSessionMail(admin);
+  db.ref("supervisorSessionEvents").orderByChild("at").startAt(sessionSince)
+      .on("child_added", (snap) => {
+        sessionMail.handleEvent(snap.key, snap.val(), sessionSince).catch((e) => log("session mail error", describeErr(e)));
+      }, (err) => log(`session listener cancelled: ${err.message}`));
 
   const watched = new Set();
   const refresh = async () => {
