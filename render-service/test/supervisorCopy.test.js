@@ -2,7 +2,7 @@
 // Run: node --test test/supervisorCopy.test.js
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {copyRecipients} = require("../mailReplies");
+const {copyRecipients, dropSupervisorCopyOnMirror} = require("../mailReplies");
 
 test("nothing is sent unless a switch or an address is set", () => {
   assert.deepEqual(copyRecipients({orgSwitchOn: false, orgEmail: "org@x.co", supMail: null}), []);
@@ -22,4 +22,11 @@ test("supervisor copy only needs the supervisor's own enabled address", () => {
 test("both get a copy, but the same address is not mailed twice", () => {
   assert.equal(copyRecipients({orgSwitchOn: true, orgEmail: "a@x.co", supMail: {email: "b@x.co"}}).length, 2);
   assert.equal(copyRecipients({orgSwitchOn: true, orgEmail: "a@x.co", supMail: {email: "a@x.co"}}).length, 1);
+});
+
+test("a mirrored supervisor message does not mail the supervisor again", () => {
+  const both = copyRecipients({orgSwitchOn: true, orgEmail: "a@x.co", supMail: {email: "b@x.co"}});
+  assert.equal(both.length, 2);
+  assert.deepEqual(dropSupervisorCopyOnMirror(both, {mirrorOf: "orgA/key1"}), [{kind: "org", to: "a@x.co"}]);
+  assert.equal(dropSupervisorCopyOnMirror(both, {}).length, 2);
 });

@@ -286,6 +286,14 @@ function copyRecipients({orgSwitchOn, orgEmail, supMail}) {
   return out;
 }
 
+/**
+ * A supervisor message mirrored into other stores (mirrorOf is set) is the same message: the supervisor already got a
+ * copy for the original, so only the store's own copy (org) is kept for the mirror.
+ */
+function dropSupervisorCopyOnMirror(recipients, m) {
+  return m && m.mirrorOf ? recipients.filter((r) => r.kind !== "sup") : recipients;
+}
+
 function makeSupervisorCopy(admin) {
   const db = admin.database();
   const retries = new Map(); // `${org}/${key}/${kind}` -> attempts
@@ -301,7 +309,10 @@ function makeSupervisorCopy(admin) {
       m.fromAdminId ? db.ref(`supervisors/${m.fromAdminId}/mailCopy`).once("value") : Promise.resolve({val: () => null}),
       inquiryEmailFor(db, orgId),
     ]);
-    const recipients = copyRecipients({orgSwitchOn: orgSwitchSnap.val() === true, orgEmail: inq.email, supMail: supSnap.val()});
+    const recipients = dropSupervisorCopyOnMirror(
+      copyRecipients({orgSwitchOn: orgSwitchSnap.val() === true, orgEmail: inq.email, supMail: supSnap.val()}),
+      m
+    );
     if (!recipients.length) return; // nothing switched on for this message: stay silent
 
     let name = "כל המשתמשים";
@@ -687,4 +698,4 @@ function start(admin) {
   return state;
 }
 
-module.exports = {start, state, handleInbound, extractReplyText, isAuthenticated, tidFor, copyRecipients, _internals: {makeIncoming, makeOutgoing, buildSource, pollScriptOnce}};
+module.exports = {start, state, handleInbound, extractReplyText, isAuthenticated, tidFor, copyRecipients, dropSupervisorCopyOnMirror, _internals: {makeIncoming, makeOutgoing, buildSource, pollScriptOnce}};
