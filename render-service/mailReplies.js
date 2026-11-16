@@ -326,6 +326,11 @@ function makeSupervisorCopy(admin) {
       }
     }
     const dept = m.department ? `מחלקה: ${m.department}\n` : "";
+    // Annex 3.3.2: full date and time (with seconds, Israel time) and, when the message was saved with one, the station.
+    const when = Number(m.timestamp) > 0
+      ? new Date(Number(m.timestamp)).toLocaleString("he-IL", {timeZone: "Asia/Jerusalem", hour12: false})
+      : "";
+    const stamp = `${when ? `זמן: ${when}\n` : ""}${m.station ? `עמדה: ${String(m.station).slice(0, 60)}\n` : ""}`;
     let supName = "";
     if (m.fromAdminId) supName = String((await db.ref(`supervisors/${m.fromAdminId}/displayName`).once("value")).val() || "").trim();
 
@@ -338,7 +343,7 @@ function makeSupervisorCopy(admin) {
         const canReply = r.kind === "org" && tid;
         const text =
           `הודעת מפקח${supName ? ` (${supName})` : ""}${inq.orgName ? ` - ${inq.orgName}` : ""}\n` +
-          `אל: ${name}\n${dept}\n${message}\n\n———\n` +
+          `אל: ${name}\n${dept}${stamp}\n${message}\n\n———\n` +
           (canReply
             ? "להשיב למשתמש: פשוט השב למייל הזה. התשובה תופיע אצלו בקיוסק.\nאל תשנה את כתובת התגובה ואל תעביר את המייל הלאה."
             : "זהו עותק לידיעה בלבד.");
