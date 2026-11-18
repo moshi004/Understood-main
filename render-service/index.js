@@ -1684,6 +1684,56 @@ app.post("/getOrgUserPassword", async (req, res) => {
   }
 });
 
+// ── Owner VIP entry ───────────────────────────────────────────────────
+// Lets a verified system owner (owners/{uid}) open an organization's admin
+// dashboard or a supervision organization's dashboard without knowing its
+// login details. Returns a short-lived Firebase custom token for the real
+// admin/supervisor uid, so the dashboard behaves exactly as if that account
+// had signed in (no frontend special-casing needed).
+app.post("/ownerImpersonate", async (req, res) => {
+  const correlationId = generateCorrelationId();
+  const log = createLogger({correlationId, service: "owner-impersonate"});
+  try {
+    const ownerUid = await verifyOwner(req);
+    if (!ownerUid) return callableError(res, 403, "permission-denied", "רק בעלי מערכת יכולים להיכנס בכניסת VIP");
+    const {kind, orgId, supervisorUid} = (req.body && req.body.data) || {};
+
+    if (kind === "org") {
+      if (!orgId || typeof orgId !== "string") return callableError(res, 400, "invalid-argument", "Missing orgId");
+      const usersSnap = await admin.database().ref(`organizations/${orgId}/users`).once("value");
+      if (!usersSnap.exists()) return callableError(res, 404, "not-found", "הארגון לא נמצא או שאין בו משתמשים");
+      const users = usersSnap.val();
+      const admins = Object.keys(users).filter((uid) => users[uid] && (users[uid].role === "admin" || users[uid].isAdmin === true));
+      if (!admins.length) return callableError(res, 404, "not-found", "לא נמצא מנהל בארגון");
+      // Prefer an explicit role:"admin" over legacy isAdmin, then the oldest account.
+      admins.sort((a, b) => {
+        const ra = users[a].role === "admin" ? 0 : 1;
+        const rb = users[b].role === "admin" ? 0 : 1;
+        if (ra !== rb) return ra - rb;
+        return String(users[a].createdAt || "").localeCompare(String(users[b].createdAt || ""));
+      });
+      const targetUid = admins[0];
+      const token = await admin.auth().createCustomToken(targetUid, {vipByOwner: ownerUid});
+      log.info("Owner VIP entry to org", {ownerUid, orgId, targetUid, correlationId});
+      return callableOk(res, {success: true, token, uid: targetUid, orgId});
+    }
+
+    if (kind === "supervisor") {
+      if (!supervisorUid || typeof supervisorUid !== "string") return callableError(res, 400, "invalid-argument", "Missing supervisorUid");
+      const supSnap = await admin.database().ref(`supervisors/${supervisorUid}`).once("value");
+      if (!supSnap.exists()) return callableError(res, 404, "not-found", "ארגון הפיקוח לא נמצא");
+      const token = await admin.auth().createCustomToken(supervisorUid, {vipByOwner: ownerUid});
+      log.info("Owner VIP entry to supervision org", {ownerUid, supervisorUid, correlationId});
+      return callableOk(res, {success: true, token, uid: supervisorUid});
+    }
+
+    return callableError(res, 400, "invalid-argument", "kind must be 'org' or 'supervisor'");
+  } catch (error) {
+    log.error("Error in owner VIP entry", error, {correlationId});
+    return callableError(res, 500, "internal", "שגיאה בכניסת VIP: " + error.message);
+  }
+});
+
 // ── Kiosk log shipping (Redis-backed, self-cleaning) ─────────────────
 // Ingestion (kiosk -> bridge): simple static API key, same model as the
 // old entertainment-channel shipping used (kiosk is not a browser client
