@@ -282,6 +282,15 @@ module.exports = function registerBillingRoutes(app, deps) {
     return v;
   }
 
+  // Firebase rejects any undefined value, so build the log entry without one (a switch sends no contractText).
+  const auditDetails = (params) => {
+    const d = {};
+    Object.entries(params || {}).forEach(([k, v]) => {
+      if (v === undefined) return;
+      d[k] = k === "contractText" ? "(updated)" : v;
+    });
+    return d;
+  };
   const audit = (orgId, by, action, details) =>
     db().ref(`billing/orgs/${orgId}/audit`).push({at: Date.now(), by, action, details: details || null});
 
@@ -417,7 +426,7 @@ module.exports = function registerBillingRoutes(app, deps) {
           if (!next.firstBillableMonth || next.firstBillableMonth < curMonth) next.firstBillableMonth = curMonth;
         }
         await db().ref("billing/config").set(next);
-        await db().ref("billing/auditGlobal").push({at: now, by: ownerUid, action, details: {...p, contractText: p.contractText ? "(updated)" : undefined}});
+        await db().ref("billing/auditGlobal").push({at: now, by: ownerUid, action, details: auditDetails(p)});
         return res.json({success: true, config: next});
       }
       if (action === "saveApiValid") {

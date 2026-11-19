@@ -43,7 +43,13 @@ function makeDb(initial) {
   const root = JSON.parse(JSON.stringify(initial));
   const parts = (p) => p.split("/").filter(Boolean);
   const get = (p) => parts(p).reduce((n, k) => (n == null ? undefined : n[k]), root);
+  // Like the real Firebase: an undefined anywhere in a written value is an error.
+  const noUndefined = (v) => {
+    if (v === undefined) throw new Error("value argument contains undefined");
+    if (v && typeof v === "object") Object.values(v).forEach(noUndefined);
+  };
   const setAt = (p, v) => {
+    if (v !== null) noUndefined(v);
     const ks = parts(p);
     let n = root;
     ks.slice(0, -1).forEach((k) => { if (typeof n[k] !== "object" || n[k] === null) n[k] = {}; n = n[k]; });
@@ -227,4 +233,13 @@ test("a zero-amount invoice is settled at once and never blocks the org", async 
   assert.equal(inv.amount, 0);
   assert.equal(inv.status, "paid");
   assert.equal(r.status.state, "ok");
+});
+
+test("the free-for-all switch saves and logs without sending undefined to Firebase", async () => {
+  const {call, store} = setup(ORG(prevMonth()));
+  const r = await call("/billing/ownerAction", {action: "saveConfig", params: {freeForAll: true}});
+  assert.equal(r.success, true);
+  assert.equal(store.root.billing.config.freeForAll, true);
+  const log = Object.values(store.root.billing.auditGlobal)[0];
+  assert.equal(log.details.freeForAll, true);
 });
