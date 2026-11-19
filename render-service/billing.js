@@ -43,12 +43,15 @@ const DEFAULT_CONFIG = {
   graceDays: 7,
   claimWindowDays: 3,
   firstBillableMonth: "2026-10",
+  freeForAll: false,
   nedarimMosadId: "7009078",
   contractVersion: 1,
   contractText: DEFAULT_CONTRACT,
 };
 
 const r2 = (n) => Math.round(n * 100) / 100;
+/** Free = this org is exempt, or the owner switched billing off for everyone (cfg.freeForAll). */
+const isFree = (settings, cfg) => (settings && settings.exempt === true) || (cfg && cfg.freeForAll === true);
 const pad = (n) => String(n).padStart(2, "0");
 const num = (v, d) => (typeof v === "number" && isFinite(v) ? v : d);
 
@@ -160,7 +163,7 @@ module.exports = function registerBillingRoutes(app, deps) {
       lines.push({id, name: (c && c.computerName) || id, activeDays: days, tier, price: r2(p)});
     });
     subtotal = r2(subtotal);
-    const exempt = settings.exempt === true;
+    const exempt = isFree(settings, cfg);
     const total = exempt ? 0 : r2(Math.max(minimum, subtotal));
     return {
       month: ym, daysInMonth: dim, threshold, pricePerComputer: price, minimumMonthly: minimum,
@@ -170,7 +173,7 @@ module.exports = function registerBillingRoutes(app, deps) {
   }
 
   function evaluate(settings, invoices, cfg, nowMs) {
-    if (settings.exempt === true) return {state: "free"};
+    if (isFree(settings, cfg)) return {state: "free"};
     if (settings.manualBlock === true) {
       return {state: "blocked", reason: "manual", message: settings.blockMessage || ""};
     }
@@ -218,9 +221,11 @@ module.exports = function registerBillingRoutes(app, deps) {
     const trialEndsAt = num(settings.trialEndsAt, base + num(cfg.trialDays, 30) * DAY);
 
     // Issue invoices for closed months (never before firstBillableMonth, never inside the trial).
-    if (settings.exempt !== true) {
+    if (!isFree(settings, cfg)) {
       const cur = ilMonth(nowMs);
       let ym = cfg.firstBillableMonth || cur;
+      // Billing switched on again later (org exempt -> normal): start from that month, never back-bill the free period.
+      if (typeof settings.billFrom === "string" && settings.billFrom > ym) ym = settings.billFrom;
       for (let i = 0; i < 24 && ym < cur; i++, ym = nextYM(ym)) {
         if (invoices[ym]) continue;
         if (monthStartMs(nextYM(ym)) <= trialEndsAt) continue;
@@ -234,6 +239,7 @@ module.exports = function registerBillingRoutes(app, deps) {
             minimumMonthly: ch.minimumMonthly, lines: ch.lines,
           },
         };
+        if (inv.amount <= 0) { inv.status = "paid"; inv.paidAt = nowMs; inv.paidVia = "zero"; }
         // A standing order that over-collected earlier leaves a credit: use it on the new invoice.
         if (credit > 0 && inv.amount > 0) {
           const use = r2(Math.min(credit, inv.amount));
@@ -307,11 +313,11 @@ module.exports = function registerBillingRoutes(app, deps) {
           .sort((a, b) => (a.month < b.month ? 1 : -1));
       return res.json({
         success: true, status: o.status, estimate: o.estimate, invoices,
-        config: publicConfig(cfg), exempt: o.settings.exempt === true, trialEndsAt: o.trialEndsAt,
+        config: publicConfig(cfg), exempt: isFree(o.settings, cfg), trialEndsAt: o.trialEndsAt,
         recurring: o.recurring ? {active: o.recurring.active === true, amount: o.recurring.amount, startedAt: o.recurring.startedAt || null} : null,
         credit: o.credit || 0,
         contract: {
-          required: o.settings.exempt !== true && !!cfg.contractText,
+          required: !isFree(o.settings, cfg) && !!cfg.contractText,
           accepted: !!(accepted && accepted.version === cfg.contractVersion),
           acceptedAt: accepted ? accepted.acceptedAt : null, acceptedBy: accepted ? accepted.fullName : null,
         },
@@ -355,7 +361,7 @@ module.exports = function registerBillingRoutes(app, deps) {
       }
       const hasApi = !!(process.env.BILLING_NEDARIM_API_VALID ||
         (await db().ref("billing/secret/apiValid").once("value")).exists());
-      return res.json({success: true, config: cfg, rows, apiValidConfigured: hasApi});
+      return res.json({success: true, config: cfg, rows, apiValidConfigured: hasApi, freeForAll: cfg.freeForAll === true});
     } catch (e) {
       console.error("billing/overview error:", e.message);
       return fail(res, 500, "Internal error");
@@ -399,11 +405,16 @@ module.exports = function registerBillingRoutes(app, deps) {
         numField("pricePerComputer", 0, 100000); numField("minimumMonthly", 0, 1000000);
         numField("fullMonthThresholdPct", 1, 100); numField("trialDays", 0, 3650);
         numField("graceDays", 0, 365); numField("claimWindowDays", 0, 60);
+        if (p.freeForAll !== undefined) next.freeForAll = p.freeForAll === true;
         if (typeof p.firstBillableMonth === "string" && /^\d{4}-\d{2}$/.test(p.firstBillableMonth)) next.firstBillableMonth = p.firstBillableMonth;
         if (typeof p.nedarimMosadId === "string" && /^\d{3,12}$/.test(p.nedarimMosadId)) next.nedarimMosadId = p.nedarimMosadId;
         if (typeof p.contractText === "string" && p.contractText !== cur.contractText) {
           next.contractText = p.contractText.slice(0, 20000);
           next.contractVersion = num(cur.contractVersion, 1) + 1;
+        }
+        if (cur.freeForAll === true && next.freeForAll !== true) {
+          const curMonth = ilMonth(now);
+          if (!next.firstBillableMonth || next.firstBillableMonth < curMonth) next.firstBillableMonth = curMonth;
         }
         await db().ref("billing/config").set(next);
         await db().ref("billing/auditGlobal").push({at: now, by: ownerUid, action, details: {...p, contractText: p.contractText ? "(updated)" : undefined}});
@@ -421,7 +432,10 @@ module.exports = function registerBillingRoutes(app, deps) {
 
       if (action === "saveSettings") {
         const s = {};
-        if (p.exempt !== undefined) s.exempt = p.exempt === true;
+        if (p.exempt !== undefined) {
+          s.exempt = p.exempt === true;
+          if (s.exempt === false) s.billFrom = ilMonth(now);
+        }
         ["pricePerComputer", "minimumMonthly"].forEach((k) => {
           if (p[k] === undefined) return;
           if (p[k] === null || p[k] === "") { s[k] = null; return; }
@@ -515,7 +529,7 @@ module.exports = function registerBillingRoutes(app, deps) {
       if (!who) return fail(res, 403, "Forbidden");
       const cfg = await getConfig();
       const o = await refreshOrg(orgId, cfg, Date.now());
-      if (o.settings.exempt === true) return fail(res, 400, "לארגון זה אין חיוב");
+      if (isFree(o.settings, cfg)) return fail(res, 400, "לארגון זה אין חיוב");
       const accepted = o.contract && o.contract.accepted;
       if (cfg.contractText && !(accepted && accepted.version === cfg.contractVersion)) {
         return fail(res, 409, "יש לחתום על ההסכם לפני התשלום", {code: "contract-required"});

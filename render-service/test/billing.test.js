@@ -179,3 +179,52 @@ test("a standing-order callback with a wrong token is refused", async () => {
   await registered["/billingCallback"]({headers: {}, query: {hk: "1", t: "nope"}, body: {Param2: "acme", TransactionId: "T", Status: "OK", Amount: "10"}, get: () => "h", socket: {}}, res);
   assert.equal(code, 403);
 });
+
+// ── free switches ────────────────────────────────────────────────────
+const prevMonth = () => { const d = new Date(); d.setUTCMonth(d.getUTCMonth() - 1, 1); return d.toISOString().slice(0, 7); };
+const thisMonth = () => new Date().toISOString().slice(0, 7);
+const ORG = (lastMonth) => ({acme: {metadata: {name: "Acme", createdAt: "2020-01-01T00:00:00Z"}, users: {own: {isAdmin: true}}, computers: {a: {usageDays: DAYS(lastMonth, 25)}}}});
+
+test("free for everyone: no invoices, no gate, no contract, no payment", async () => {
+  const lm = prevMonth();
+  const {call} = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm, freeForAll: true}}});
+  const r = await call("/billing/summary", {orgId: "acme"});
+  assert.equal(r.status.state, "free");
+  assert.equal(r.invoices.length, 0);
+  assert.equal(r.exempt, true);
+  assert.equal(r.contract.required, false);
+  assert.equal(r.estimate.total, 0);
+  const pay = await call("/billing/payConfig", {orgId: "acme", recurring: true});
+  assert.equal(pay.code, 400);
+});
+
+test("turning free-for-all off bills from this month on, never back-bills the free period", async () => {
+  const lm = prevMonth();
+  const {call, store} = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm, freeForAll: true}}});
+  await call("/billing/summary", {orgId: "acme"});
+  await call("/billing/ownerAction", {action: "saveConfig", params: {freeForAll: false}});
+  assert.equal(store.root.billing.config.freeForAll, false);
+  assert.equal(store.root.billing.config.firstBillableMonth, thisMonth());
+  const r = await call("/billing/summary", {orgId: "acme"});
+  assert.equal(r.invoices.length, 0, "last month (free) is not billed");
+  assert.equal(r.status.state, "ok");
+});
+
+test("an org taken off exempt is billed from this month on only", async () => {
+  const lm = prevMonth();
+  const {call, store} = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm}, orgs: {acme: {settings: {exempt: true}}}}});
+  await call("/billing/ownerAction", {action: "saveSettings", orgId: "acme", params: {exempt: false}});
+  assert.equal(store.root.billing.orgs.acme.settings.billFrom, thisMonth());
+  const r = await call("/billing/summary", {orgId: "acme"});
+  assert.equal(r.invoices.length, 0);
+});
+
+test("a zero-amount invoice is settled at once and never blocks the org", async () => {
+  const lm = prevMonth();
+  const {call} = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm, pricePerComputer: 0, minimumMonthly: 0}}});
+  const r = await call("/billing/summary", {orgId: "acme"});
+  const inv = r.invoices.find((i) => i.month === lm);
+  assert.equal(inv.amount, 0);
+  assert.equal(inv.status, "paid");
+  assert.equal(r.status.state, "ok");
+});
