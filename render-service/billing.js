@@ -61,6 +61,41 @@ const monthStartMs = (ym) => { const {y, m} = parseYM(ym); return Date.UTC(y, m 
 const nextYM = (ym) => { const {y, m} = parseYM(ym); return m === 12 ? `${y + 1}-01` : `${y}-${pad(m + 1)}`; };
 const daysInMonth = (ym) => { const {y, m} = parseYM(ym); return new Date(Date.UTC(y, m, 0)).getUTCDate(); };
 
+/**
+ * Spreads a payment over the open invoices, oldest month first.
+ * Pure: takes {YYYY-MM: invoice}, returns the field updates per invoice and what is left over
+ * (a standing order that charges more than the invoice leaves a credit that is used next month).
+ */
+function applyPayment(invoices, amount, nowMs, via) {
+  let left = r2(num(amount, 0));
+  const updates = {};
+  Object.values(invoices || {})
+      .filter((i) => i && (i.status === "unpaid" || i.status === "claimed"))
+      .sort((a, b) => (a.month < b.month ? -1 : 1))
+      .forEach((inv) => {
+        if (left <= 0) return;
+        const owed = r2(num(inv.amount, 0) - num(inv.paidAmount, 0));
+        if (owed <= 0) return;
+        const pay = r2(Math.min(owed, left));
+        left = r2(left - pay);
+        const paid = r2(num(inv.paidAmount, 0) + pay);
+        const done = paid + 0.01 >= num(inv.amount, 0);
+        updates[inv.month] = {
+          paidAmount: paid, lastPaymentAt: nowMs,
+          ...(done ? {status: "paid", paidAt: nowMs, paidVia: via || "nedarim"} : {}),
+        };
+      });
+  return {updates, leftover: left};
+}
+
+/** Standing-order amount: the larger of this month's running estimate and the last invoice, whole shekels. */
+function recurringAmount(estimateTotal, invoices, minimum) {
+  const last = Object.values(invoices || {})
+      .filter((i) => i && i.status !== "void")
+      .sort((a, b) => (a.month < b.month ? 1 : -1))[0];
+  return Math.ceil(Math.max(num(estimateTotal, 0), last ? num(last.amount, 0) : 0, num(minimum, 0)));
+}
+
 module.exports = function registerBillingRoutes(app, deps) {
   const {admin, verifyOwner} = deps;
 
@@ -174,6 +209,7 @@ module.exports = function registerBillingRoutes(app, deps) {
     const settings = bill.settings || {};
     const invoices = {...(bill.invoices || {})};
     const updates = {};
+    let credit = num(bill.credit, 0);
 
     let startedAt = num(bill.startedAt, 0);
     if (!startedAt) { startedAt = nowMs; updates[`billing/orgs/${orgId}/startedAt`] = startedAt; }
@@ -198,6 +234,15 @@ module.exports = function registerBillingRoutes(app, deps) {
             minimumMonthly: ch.minimumMonthly, lines: ch.lines,
           },
         };
+        // A standing order that over-collected earlier leaves a credit: use it on the new invoice.
+        if (credit > 0 && inv.amount > 0) {
+          const use = r2(Math.min(credit, inv.amount));
+          credit = r2(credit - use);
+          inv.paidAmount = use;
+          inv.paidVia = "credit";
+          if (use + 0.01 >= inv.amount) { inv.status = "paid"; inv.paidAt = nowMs; }
+          updates[`billing/orgs/${orgId}/credit`] = credit;
+        }
         invoices[ym] = inv;
         updates[`billing/orgs/${orgId}/invoices/${ym}`] = inv;
       }
@@ -211,7 +256,10 @@ module.exports = function registerBillingRoutes(app, deps) {
     if (Object.keys(updates).length) await db().ref().update(updates);
 
     const estimate = computeCharge(computers, ilMonth(nowMs), settings, cfg, nowMs);
-    return {meta, settings, invoices, status: next, estimate, contract: bill.contract || null, trialEndsAt, computerCount: Object.keys(computers).length};
+    return {
+      meta, settings, invoices, status: next, estimate, contract: bill.contract || null, trialEndsAt,
+      computerCount: Object.keys(computers).length, recurring: bill.recurring || null, credit,
+    };
   }
 
   // Short-lived cache: every open dashboard re-asks every 15 min and the owner
@@ -260,6 +308,8 @@ module.exports = function registerBillingRoutes(app, deps) {
       return res.json({
         success: true, status: o.status, estimate: o.estimate, invoices,
         config: publicConfig(cfg), exempt: o.settings.exempt === true, trialEndsAt: o.trialEndsAt,
+        recurring: o.recurring ? {active: o.recurring.active === true, amount: o.recurring.amount, startedAt: o.recurring.startedAt || null} : null,
+        credit: o.credit || 0,
         contract: {
           required: o.settings.exempt !== true && !!cfg.contractText,
           accepted: !!(accepted && accepted.version === cfg.contractVersion),
@@ -298,6 +348,8 @@ module.exports = function registerBillingRoutes(app, deps) {
             contractAccepted: !!(o.contract && o.contract.accepted && o.contract.accepted.version === cfg.contractVersion),
             contractBy: o.contract && o.contract.accepted ? o.contract.accepted.fullName : null,
             trialEndsAt: o.trialEndsAt,
+            recurring: o.recurring ? {active: o.recurring.active === true, amount: o.recurring.amount} : null,
+            credit: o.credit || 0,
           });
         } catch (e) { console.error("billing overview org error:", orgId, e.message); }
       }
@@ -399,6 +451,10 @@ module.exports = function registerBillingRoutes(app, deps) {
           status: "paid", paidAmount: inv.amount, paidAt: now, paidVia: "manual",
         });
         await audit(orgId, ownerUid, action, {month: ym, note: p.note || ""});
+      } else if (action === "clearRecurring") {
+        await db().ref(`billing/orgs/${orgId}/recurring`).remove();
+        await db().ref(`billing/secret/hkTokens/${orgId}`).remove();
+        await audit(orgId, ownerUid, action);
       } else if (action === "voidInvoice") {
         await db().ref(`billing/orgs/${orgId}/invoices/${p.month}`).update({status: "void", voidedAt: now});
         await audit(orgId, ownerUid, action, {month: p.month});
@@ -452,13 +508,14 @@ module.exports = function registerBillingRoutes(app, deps) {
     orgCache.clear();
     try {
       const {orgId, month} = req.body || {};
-      if (!orgId || !/^\d{4}-\d{2}$/.test(month || "")) return fail(res, 400, "orgId and month required");
+      const recurring = !!(req.body && req.body.recurring === true);
+      if (!orgId) return fail(res, 400, "orgId required");
+      if (!recurring && !/^\d{4}-\d{2}$/.test(month || "")) return fail(res, 400, "orgId and month required");
       const who = await orgAccess(req, orgId);
       if (!who) return fail(res, 403, "Forbidden");
       const cfg = await getConfig();
       const o = await refreshOrg(orgId, cfg, Date.now());
-      const inv = o.invoices[month];
-      if (!inv || (inv.status !== "unpaid" && inv.status !== "claimed")) return fail(res, 400, "אין חיוב פתוח לחודש זה");
+      if (o.settings.exempt === true) return fail(res, 400, "לארגון זה אין חיוב");
       const accepted = o.contract && o.contract.accepted;
       if (cfg.contractText && !(accepted && accepted.version === cfg.contractVersion)) {
         return fail(res, 409, "יש לחתום על ההסכם לפני התשלום", {code: "contract-required"});
@@ -466,12 +523,33 @@ module.exports = function registerBillingRoutes(app, deps) {
       const apiValid = process.env.BILLING_NEDARIM_API_VALID ||
         (await db().ref("billing/secret/apiValid").once("value")).val();
       if (!apiValid) return fail(res, 503, "התשלום טרם הוגדר (חסר ApiValid של נדרים)");
+      const base = process.env.PUBLIC_BASE_URL || `https://${req.get("host")}`;
+
+      if (recurring) {
+        // Standing order (הוראת קבע): ONE persistent secret per org, charges are matched to the oldest open invoice.
+        const amount = recurringAmount(o.estimate.total, o.invoices, num(o.settings.minimumMonthly, cfg.minimumMonthly));
+        if (!(amount > 0)) return fail(res, 400, "לא ניתן לחשב סכום להוראת קבע");
+        const tokRef = db().ref(`billing/secret/hkTokens/${orgId}`);
+        let token = (await tokRef.once("value")).val();
+        if (!token) { token = crypto.randomBytes(24).toString("hex"); await tokRef.set(token); }
+        await db().ref(`billing/orgs/${orgId}/recurringPending`).set({amount, at: Date.now()});
+        return res.json({
+          success: true, mosadId: cfg.nedarimMosadId, apiValid, amount, month: "",
+          paymentType: "HK", tashlumim: "0",
+          callbackUrl: `${base}/billingCallback?hk=1&t=${token}`,
+          comment: `SIONYX הוראת קבע - ${o.meta.name || orgId}`,
+        });
+      }
+
+      const inv = o.invoices[month];
+      if (!inv || (inv.status !== "unpaid" && inv.status !== "claimed")) return fail(res, 400, "אין חיוב פתוח לחודש זה");
       const token = crypto.randomBytes(24).toString("hex");
       await db().ref(`billing/secret/payTokens/${orgId}/${month}`).set(token);
       const amountLeft = r2(inv.amount - (inv.paidAmount || 0));
       return res.json({
         success: true, mosadId: cfg.nedarimMosadId, apiValid, amount: amountLeft, month,
-        callbackUrl: `${process.env.PUBLIC_BASE_URL || `https://${req.get("host")}`}/billingCallback?t=${token}`,
+        paymentType: "Ragil", tashlumim: "1",
+        callbackUrl: `${base}/billingCallback?t=${token}`,
         comment: `SIONYX ${month} - ${o.meta.name || orgId}`,
       });
     } catch (e) {
@@ -502,12 +580,50 @@ module.exports = function registerBillingRoutes(app, deps) {
     } catch (e) { return fail(res, 500, "Internal error"); }
   });
 
+  // Standing-order charge: matched by the org's persistent token, spread over the oldest open invoices,
+  // any surplus kept as credit. Each Nedarim transaction id is applied once.
+  async function handleRecurringCallback(req, res, body) {
+    const orgId = String(body.Param2 || "");
+    const token = String(req.query.t || "");
+    if (!orgId || !token) return fail(res, 400, "Bad request");
+    const stored = (await db().ref(`billing/secret/hkTokens/${orgId}`).once("value")).val();
+    const a = Buffer.from(token); const b = Buffer.from(String(stored || ""));
+    if (!stored || a.length !== b.length || !crypto.timingSafeEqual(a, b)) return fail(res, 403, "Forbidden");
+    const txId = body.TransactionId || body.KevaId;
+    const status = body.Result || body.Status || (body.KevaId ? "OK" : undefined);
+    const amount = Number(body.Amount);
+    if (!txId || !status || !isFinite(amount) || amount <= 0) return fail(res, 400, "Missing fields");
+    if (status !== "OK") return res.json({success: true, message: "Not a successful charge"});
+    const txKey = String(txId).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+    const txRef = db().ref(`billing/orgs/${orgId}/hkTx/${txKey}`);
+    if ((await txRef.once("value")).exists()) return res.json({success: true, message: "Already processed"});
+    const now = Date.now();
+    const bill = (await db().ref(`billing/orgs/${orgId}`).once("value")).val() || {};
+    const {updates, leftover} = applyPayment(bill.invoices || {}, amount, now, "nedarim-hk");
+    const multi = {};
+    Object.entries(updates).forEach(([ym, fields]) => {
+      Object.entries(fields).forEach(([k, v]) => { multi[`billing/orgs/${orgId}/invoices/${ym}/${k}`] = v; });
+    });
+    if (leftover > 0) multi[`billing/orgs/${orgId}/credit`] = r2(num(bill.credit, 0) + leftover);
+    multi[`billing/orgs/${orgId}/hkTx/${txKey}`] = {at: now, amount: r2(amount)};
+    const prevRec = bill.recurring || {};
+    multi[`billing/orgs/${orgId}/recurring`] = {
+      active: true, kevaId: body.KevaId ? String(body.KevaId) : (prevRec.kevaId || null),
+      amount: num((bill.recurringPending || {}).amount, num(prevRec.amount, r2(amount))),
+      startedAt: prevRec.startedAt || now, lastChargeAt: now,
+    };
+    await db().ref().update(multi);
+    await refreshOrg(orgId, await getConfig(), now);
+    return res.json({success: true});
+  }
+
   // ── POST /billingCallback  (public webhook from Nedarim) ────────────
   // Param1 = month (YYYY-MM), Param2 = orgId, ?t= per-invoice secret token.
   app.post("/billingCallback", async (req, res) => {
     orgCache.clear();
     try {
       const body = req.body || {};
+      if (req.query.hk === "1") return await handleRecurringCallback(req, res, body);
       const month = String(body.Param1 || "");
       const orgId = String(body.Param2 || "");
       const token = String(req.query.t || "");
@@ -539,3 +655,6 @@ module.exports = function registerBillingRoutes(app, deps) {
     }
   });
 };
+
+module.exports.applyPayment = applyPayment;
+module.exports.recurringAmount = recurringAmount;

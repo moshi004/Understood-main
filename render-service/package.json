@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/supervisorCopy.test.js"
+    "test": "node --test test/supervisorCopy.test.js test/billing.test.js"
   },
   "dependencies": {
     "express": "^4.19.2",
