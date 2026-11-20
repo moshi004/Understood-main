@@ -243,3 +243,62 @@ test("the free-for-all switch saves and logs without sending undefined to Fireba
   const log = Object.values(store.root.billing.auditGlobal)[0];
   assert.equal(log.details.freeForAll, true);
 });
+
+test("free until a date: free now, no invoice for the free months, billed after", async () => {
+  const lm = prevMonth();
+  const {call} = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm}, orgs: {acme: {settings: {freeUntil: Date.now() + 5 * 86400000}}}}});
+  const r = await call("/billing/summary", {orgId: "acme"});
+  assert.equal(r.status.state, "free");
+  assert.equal(r.invoices.length, 0);
+  // date already passed: the org pays again, but last month (inside the free window) is still not billed
+  const past = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm}, orgs: {acme: {settings: {freeUntil: Date.now() - 86400000, trialDays: 0}}}}});
+  const r2 = await past.call("/billing/summary", {orgId: "acme"});
+  assert.notEqual(r2.status.state, "free");
+});
+
+test("a free-until date in the past covers the months it spanned", async () => {
+  const lm = prevMonth();
+  const endOfThisMonthStart = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1);
+  const {call} = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm}, orgs: {acme: {settings: {freeUntil: endOfThisMonthStart, trialDays: 0}}}}});
+  const r = await call("/billing/summary", {orgId: "acme"});
+  assert.equal(r.invoices.length, 0, "last month ended before freeUntil");
+});
+
+test("per-org trial days override the global trial", async () => {
+  const lm = prevMonth();
+  const orgs = ORG(lm);
+  orgs.acme.metadata.createdAt = new Date(Date.now() - 70 * 86400000).toISOString();
+  const long = setup(JSON.parse(JSON.stringify(orgs)), {billing: {config: {firstBillableMonth: lm, trialDays: 5}, orgs: {acme: {settings: {trialDays: 400}}}}});
+  assert.equal((await long.call("/billing/summary", {orgId: "acme"})).invoices.length, 0);
+  const std = setup(JSON.parse(JSON.stringify(orgs)), {billing: {config: {firstBillableMonth: lm, trialDays: 5}}});
+  assert.equal((await std.call("/billing/summary", {orgId: "acme"})).invoices.length, 1);
+});
+
+test("auto-block off (global or per org): overdue org only gets a warning", async () => {
+  const lm = prevMonth();
+  const inv = {[lm]: {month: lm, amount: 200, paidAmount: 0, status: "unpaid", issuedAt: 1, dueAt: 2}};
+  const base = {firstBillableMonth: lm};
+  const a = setup(ORG(lm), {billing: {config: base, orgs: {acme: {invoices: inv}}}});
+  assert.equal((await a.call("/billing/summary", {orgId: "acme"})).status.state, "blocked");
+  const b = setup(ORG(lm), {billing: {config: {...base, autoBlock: false}, orgs: {acme: {invoices: inv}}}});
+  const rb = await b.call("/billing/summary", {orgId: "acme"});
+  assert.equal(rb.status.state, "warning");
+  assert.equal(rb.status.overdue, true);
+  const c = setup(ORG(lm), {billing: {config: base, orgs: {acme: {invoices: inv, settings: {neverBlock: true}}}}});
+  assert.equal((await c.call("/billing/summary", {orgId: "acme"})).status.state, "warning");
+});
+
+test("overview returns a revenue summary and the new settings save without undefined", async () => {
+  const lm = prevMonth();
+  const {call, store} = setup(ORG(lm), {billing: {config: {firstBillableMonth: lm}}});
+  const s1 = await call("/billing/ownerAction", {action: "saveSettings", orgId: "acme", params: {trialDays: 12, neverBlock: true, freeUntil: Date.now() + 86400000}});
+  assert.equal(s1.success, true);
+  assert.equal(store.root.billing.orgs.acme.settings.trialDays, 12);
+  const g = await call("/billing/ownerAction", {action: "saveConfig", params: {autoBlock: false, freeUntil: null}});
+  assert.equal(g.success, true);
+  assert.equal(store.root.billing.config.autoBlock, false);
+  const o = await call("/billing/overview", {});
+  assert.equal(o.success, true);
+  assert.equal(o.summary.orgs, 1);
+  assert.equal(o.summary.free, 1);
+});

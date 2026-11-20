@@ -44,6 +44,8 @@ const DEFAULT_CONFIG = {
   claimWindowDays: 3,
   firstBillableMonth: "2026-10",
   freeForAll: false,
+  freeUntil: 0,
+  autoBlock: true,
   nedarimMosadId: "7009078",
   contractVersion: 1,
   contractText: DEFAULT_CONTRACT,
@@ -51,7 +53,11 @@ const DEFAULT_CONFIG = {
 
 const r2 = (n) => Math.round(n * 100) / 100;
 /** Free = this org is exempt, or the owner switched billing off for everyone (cfg.freeForAll). */
-const isFree = (settings, cfg) => (settings && settings.exempt === true) || (cfg && cfg.freeForAll === true);
+const isFree = (settings, cfg, nowMs = Date.now()) =>
+  (settings && settings.exempt === true) || (cfg && cfg.freeForAll === true) ||
+  (settings && num(settings.freeUntil, 0) > nowMs) || (cfg && num(cfg.freeUntil, 0) > nowMs);
+/** Latest "free until" date that applies to this org (org-level or global), 0 if none. */
+const freeUntilOf = (settings, cfg) => Math.max(num(settings && settings.freeUntil, 0), num(cfg && cfg.freeUntil, 0));
 const pad = (n) => String(n).padStart(2, "0");
 const num = (v, d) => (typeof v === "number" && isFinite(v) ? v : d);
 
@@ -163,7 +169,7 @@ module.exports = function registerBillingRoutes(app, deps) {
       lines.push({id, name: (c && c.computerName) || id, activeDays: days, tier, price: r2(p)});
     });
     subtotal = r2(subtotal);
-    const exempt = isFree(settings, cfg);
+    const exempt = isFree(settings, cfg, nowMs);
     const total = exempt ? 0 : r2(Math.max(minimum, subtotal));
     return {
       month: ym, daysInMonth: dim, threshold, pricePerComputer: price, minimumMonthly: minimum,
@@ -173,7 +179,7 @@ module.exports = function registerBillingRoutes(app, deps) {
   }
 
   function evaluate(settings, invoices, cfg, nowMs) {
-    if (isFree(settings, cfg)) return {state: "free"};
+    if (isFree(settings, cfg, nowMs)) return {state: "free"};
     if (settings.manualBlock === true) {
       return {state: "blocked", reason: "manual", message: settings.blockMessage || ""};
     }
@@ -192,6 +198,11 @@ module.exports = function registerBillingRoutes(app, deps) {
       due += Math.max(0, r2(num(inv.amount, 0) - num(inv.paidAmount, 0)));
       if (d < blockAt) { blockAt = d; first = inv.month; }
     });
+    const neverBlock = cfg.autoBlock === false || settings.neverBlock === true;
+    if (nowMs > blockAt && neverBlock) {
+      // Automatic blocking is switched off: keep reminding, never lock the dashboard.
+      return {state: "warning", overdue: true, blockAt, amountDue: r2(due), invoiceMonth: first, daysLeft: 0};
+    }
     if (nowMs > blockAt) return {state: "blocked", reason: "unpaid", blockAt, amountDue: r2(due), invoiceMonth: first};
     return {
       state: "warning", blockAt, amountDue: r2(due), invoiceMonth: first,
@@ -218,10 +229,12 @@ module.exports = function registerBillingRoutes(app, deps) {
     if (!startedAt) { startedAt = nowMs; updates[`billing/orgs/${orgId}/startedAt`] = startedAt; }
     const createdMs = meta.createdAt ? new Date(meta.createdAt).getTime() : 0;
     const base = createdMs && isFinite(createdMs) ? createdMs : startedAt;
-    const trialEndsAt = num(settings.trialEndsAt, base + num(cfg.trialDays, 30) * DAY);
+    const trialEndsAt = Math.max(
+      num(settings.trialEndsAt, base + num(settings.trialDays, num(cfg.trialDays, 30)) * DAY),
+      freeUntilOf(settings, cfg));
 
     // Issue invoices for closed months (never before firstBillableMonth, never inside the trial).
-    if (!isFree(settings, cfg)) {
+    if (!isFree(settings, cfg, nowMs)) {
       const cur = ilMonth(nowMs);
       let ym = cfg.firstBillableMonth || cur;
       // Billing switched on again later (org exempt -> normal): start from that month, never back-bill the free period.
@@ -322,11 +335,11 @@ module.exports = function registerBillingRoutes(app, deps) {
           .sort((a, b) => (a.month < b.month ? 1 : -1));
       return res.json({
         success: true, status: o.status, estimate: o.estimate, invoices,
-        config: publicConfig(cfg), exempt: isFree(o.settings, cfg), trialEndsAt: o.trialEndsAt,
+        config: publicConfig(cfg), exempt: isFree(o.settings, cfg, now), trialEndsAt: o.trialEndsAt,
         recurring: o.recurring ? {active: o.recurring.active === true, amount: o.recurring.amount, startedAt: o.recurring.startedAt || null} : null,
         credit: o.credit || 0,
         contract: {
-          required: !isFree(o.settings, cfg) && !!cfg.contractText,
+          required: !isFree(o.settings, cfg, now) && !!cfg.contractText,
           accepted: !!(accepted && accepted.version === cfg.contractVersion),
           acceptedAt: accepted ? accepted.acceptedAt : null, acceptedBy: accepted ? accepted.fullName : null,
         },
@@ -352,7 +365,9 @@ module.exports = function registerBillingRoutes(app, deps) {
           rows.push({
             orgId, name: o.meta.name || orgId, computers: o.computerCount, state: o.status.state,
             reason: o.status.reason || null, blockAt: o.status.blockAt || null,
-            exempt: o.settings.exempt === true, manualBlock: o.settings.manualBlock === true,
+            exempt: o.settings.exempt === true, freeUntil: num(o.settings.freeUntil, 0) || null,
+            trialDays: o.settings.trialDays ?? null, neverBlock: o.settings.neverBlock === true,
+            inTrial: now < o.trialEndsAt, manualBlock: o.settings.manualBlock === true,
             pricePerComputer: o.settings.pricePerComputer ?? null, minimumMonthly: o.settings.minimumMonthly ?? null,
             graceUntil: o.settings.graceUntil || null, blockMessage: o.settings.blockMessage || "",
             estimate: o.estimate.total, estimateFull: o.estimate.full, estimateHalf: o.estimate.half, estimateNone: o.estimate.none,
@@ -370,7 +385,16 @@ module.exports = function registerBillingRoutes(app, deps) {
       }
       const hasApi = !!(process.env.BILLING_NEDARIM_API_VALID ||
         (await db().ref("billing/secret/apiValid").once("value")).exists());
-      return res.json({success: true, config: cfg, rows, apiValidConfigured: hasApi, freeForAll: cfg.freeForAll === true});
+      // Revenue picture for the top of the owner tab: expected monthly income and how the orgs split.
+      const summary = {orgs: rows.length, paying: 0, trial: 0, free: 0, blocked: 0, expectedMonthly: 0, openDebt: 0};
+      rows.forEach((r) => {
+        summary.openDebt = r2(summary.openDebt + r.amountDue);
+        if (r.state === "free") summary.free++;
+        else if (r.inTrial) summary.trial++;
+        else { summary.paying++; summary.expectedMonthly = r2(summary.expectedMonthly + r.estimate); }
+        if (r.state === "blocked") summary.blocked++;
+      });
+      return res.json({success: true, config: cfg, rows, summary, apiValidConfigured: hasApi, freeForAll: cfg.freeForAll === true});
     } catch (e) {
       console.error("billing/overview error:", e.message);
       return fail(res, 500, "Internal error");
@@ -415,6 +439,12 @@ module.exports = function registerBillingRoutes(app, deps) {
         numField("fullMonthThresholdPct", 1, 100); numField("trialDays", 0, 3650);
         numField("graceDays", 0, 365); numField("claimWindowDays", 0, 60);
         if (p.freeForAll !== undefined) next.freeForAll = p.freeForAll === true;
+        if (p.autoBlock !== undefined) next.autoBlock = p.autoBlock === true;
+        if (p.freeUntil !== undefined) {
+          const v = p.freeUntil === null ? 0 : Number(p.freeUntil);
+          if (!isFinite(v) || v < 0) throw new Error("Invalid freeUntil");
+          next.freeUntil = v;
+        }
         if (typeof p.firstBillableMonth === "string" && /^\d{4}-\d{2}$/.test(p.firstBillableMonth)) next.firstBillableMonth = p.firstBillableMonth;
         if (typeof p.nedarimMosadId === "string" && /^\d{3,12}$/.test(p.nedarimMosadId)) next.nedarimMosadId = p.nedarimMosadId;
         if (typeof p.contractText === "string" && p.contractText !== cur.contractText) {
@@ -453,6 +483,20 @@ module.exports = function registerBillingRoutes(app, deps) {
           s[k] = v;
         });
         if (p.trialEndsAt !== undefined) s.trialEndsAt = p.trialEndsAt ? Number(p.trialEndsAt) : null;
+        if (p.trialDays !== undefined) {
+          if (p.trialDays === null || p.trialDays === "") s.trialDays = null;
+          else {
+            const v = Number(p.trialDays);
+            if (!isFinite(v) || v < 0 || v > 3650) throw new Error("Invalid trialDays");
+            s.trialDays = v;
+          }
+        }
+        if (p.freeUntil !== undefined) {
+          const v = p.freeUntil ? Number(p.freeUntil) : 0;
+          if (!isFinite(v) || v < 0) throw new Error("Invalid freeUntil");
+          s.freeUntil = v || null;
+        }
+        if (p.neverBlock !== undefined) s.neverBlock = p.neverBlock === true;
         await sRef.update(s);
         await audit(orgId, ownerUid, action, s);
       } else if (action === "block") {
@@ -538,7 +582,7 @@ module.exports = function registerBillingRoutes(app, deps) {
       if (!who) return fail(res, 403, "Forbidden");
       const cfg = await getConfig();
       const o = await refreshOrg(orgId, cfg, Date.now());
-      if (isFree(o.settings, cfg)) return fail(res, 400, "לארגון זה אין חיוב");
+      if (isFree(o.settings, cfg, Date.now())) return fail(res, 400, "לארגון זה אין חיוב");
       const accepted = o.contract && o.contract.accepted;
       if (cfg.contractText && !(accepted && accepted.version === cfg.contractVersion)) {
         return fail(res, 409, "יש לחתום על ההסכם לפני התשלום", {code: "contract-required"});
